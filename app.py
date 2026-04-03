@@ -1,91 +1,153 @@
 import streamlit as st
 import pdfplumber
+import json
 import requests
-import google.generativeai as genai
+from groq import Groq
 
-# Load API keys
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-WEBHOOK_URL = st.secrets["N8N_WEBHOOK_URL"]
+# --- SETUP GROQ ---
+client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 
-# Title
-st.title("📄 AI Document Orchestrator")
+# --- PAGE SETUP ---
+st.set_page_config(page_title="AI Document Orchestrator", page_icon="📄", layout="wide")
+st.title("📄 AI-Powered Document Orchestrator")
+st.markdown("Upload a document, ask a question, and let AI do the work!")
 
-# Upload file
-uploaded_file = st.file_uploader("Upload PDF or TXT", type=["pdf", "txt"])
+# --- STEP 1: FILE UPLOAD ---
+st.header("Step 1: Upload Your Document")
+uploaded_file = st.file_uploader("Choose a PDF or TXT file", type=["pdf", "txt"])
 
-# User question
-question = st.text_input("Ask a question about the document")
+# --- WELCOME MESSAGE ---
+if uploaded_file is None:
+    st.info("👋 **Welcome!** Get started by uploading a PDF or TXT document above.")
+    st.markdown("""
+    ### How to use this app:
+    1. **Upload** a document using the file uploader
+    2. **Ask** a question about the document content
+    3. **Click Analyze** to extract structured data
+    4. **Send email alerts** with the AI analysis
+    """)
+    st.markdown("---")
 
-# Function to extract text
-def extract_text(file):
-    text = ""
-    try:
-        if file.name.lower().endswith(".pdf"):
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text() or ""
-                    text += page_text + "\n"
-        else:
-            text = file.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        st.error(f"Error extracting text: {e}")
-        return ""
-    return text.strip()
+extracted_text = ""
 
-# Step 1 + 2
-if uploaded_file and question:
-    text = extract_text(uploaded_file)
-    if not text:
-        st.warning("No text was extracted from the uploaded document.")
-    else:
-        st.subheader("📌 Extracted Text Preview")
-        st.write(text[:500])
+if uploaded_file is not None:
+    if uploaded_file.type == "application/pdf":
+        with pdfplumber.open(uploaded_file) as pdf:
+            for page in pdf.pages:
+                extracted_text += page.extract_text() or ""
+        st.success("✅ PDF uploaded and text extracted!")
+    elif uploaded_file.type == "text/plain":
+        extracted_text = uploaded_file.read().decode("utf-8")
+        st.success("✅ Text file uploaded!")
 
-        # Gemini Prompt
-        prompt = f"""
-Extract 5-8 important key-value pairs from this text based on the question below.
-Return JSON only.
-Question: {question}
-Text: {text}
-"""
+    st.subheader("📋 Extracted Text Preview:")
+    st.text_area("Raw Text (first 1000 chars)", extracted_text[:1000], height=200)
 
-        extracted_data = None
-        try:
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content(prompt)
-            extracted_data = response.text
-        except Exception as e:
-            st.error(f"Error from Gemini API: {e}")
+# --- STEP 2: QUESTION INPUT ---
+st.header("Step 2: Ask a Question About the Document")
+user_question = st.text_input("Enter your question", key="user_question")
 
-        if extracted_data:
-            st.subheader("📊 Extracted JSON")
-            st.code(extracted_data, language="json")
+# --- SESSION STATE ---
+if "extracted_json" not in st.session_state:
+    st.session_state.extracted_json = None
 
-            # Email input
-            email = st.text_input("Enter recipient email")
+# --- STEP 3: GROQ EXTRACTION ---
+if extracted_text and user_question:
+    if st.button("🔍 Analyze Document"):
+        with st.spinner("AI is analyzing your document..."):
+            prompt = f"""You are a JSON-only response bot. You must respond with ONLY a JSON object, nothing else.
 
-            # Button
-            if st.button("Send Alert Mail"):
-                if not email:
-                    st.warning("Please enter a recipient email before sending.")
+Document content:
+{extracted_text}
+
+User question: {user_question}
+
+Respond with ONLY this JSON structure, no other text before or after:
+{{
+  "key_finding_1": "value",
+  "key_finding_2": "value",
+  "key_finding_3": "value",
+  "key_finding_4": "value",
+  "key_finding_5": "value",
+  "risk_level": "High or Medium or Low"
+}}
+
+Rules:
+- Replace key_finding_1 through 5 with actual relevant field names from the document
+- Extract values that answer the user question
+- risk_level must be exactly "High", "Medium", or "Low"
+- DO NOT write anything before or after the JSON
+- DO NOT use markdown or code blocks
+- ONLY output the raw JSON object starting with {{ and ending with }}"""
+
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": "You are a JSON-only bot. You never write anything except valid JSON objects. No explanations, no markdown, no code blocks. Only raw JSON."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                raw = response.choices[0].message.content.strip()
+
+                if "```json" in raw:
+                    raw = raw.split("```json")[1].split("```")[0].strip()
+                elif "```" in raw:
+                    raw = raw.split("```")[1].split("```")[0].strip()
+
+                if not raw:
+                    st.error("❌ AI returned empty response. Try again.")
                 else:
-                    payload = {
-                        "text": text,
-                        "question": question,
-                        "extracted_data": extracted_data,
-                        "email": email,
-                    }
-                    try:
-                        res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-                        if res.status_code == 200:
-                            data = res.json()
-                            st.subheader("🧠 Final Answer")
-                            st.write(data.get("final_answer", "(no final_answer returned)"))
-                            st.subheader("📧 Email Body")
-                            st.write(data.get("email_body", "(no email_body returned)"))
-                            st.subheader("📢 Status")
-                            st.success(data.get("status", "success"))
-                        else:
-                            st.error(f"Webhook failed: {res.status_code} {res.text}")
-                    except Exception as e:
-                        st.error(f"Webhook request error: {e}")
+                    parsed = json.loads(raw)
+                    st.session_state.extracted_json = parsed
+
+            except json.JSONDecodeError as e:
+                st.error(f"❌ JSON parsing error: {e}")
+            except Exception as e:
+                st.error(f"❌ Groq error: {e}")
+
+# --- OUTPUT 1: DISPLAY EXTRACTED JSON ---
+if st.session_state.extracted_json:
+    st.header("📊 Output 1: Structured Data Extracted")
+    st.json(st.session_state.extracted_json)
+    st.success("✅ Extraction complete! Scroll down to send email alert.")
+
+    # --- STEP 4: EMAIL SECTION ---
+    st.header("Step 3: Send Alert Email")
+    recipient_email = st.text_input("Enter Recipient Email ID", key="recipient_email")
+
+    if st.button("📧 Send Alert Mail"):
+        if not recipient_email:
+            st.error("❌ Please enter a recipient email!")
+        else:
+            with st.spinner("Sending to n8n workflow..."):
+                payload = {
+                    "text": extracted_text,
+                    "extracted_json": st.session_state.extracted_json,
+                    "question": user_question,
+                    "recipient_email": recipient_email
+                }
+
+                try:
+                    response = requests.post(
+                        st.secrets["N8N_WEBHOOK_URL"],
+                        json=payload,
+                        timeout=30
+                    )
+                    result = response.json()
+
+                    st.header("📊 Output 2: Final Analytical Answer")
+                    st.write(result.get("final_answer", "No answer received"))
+
+                    st.header("📧 Output 3: Generated Email Body")
+                    st.write(result.get("email_body", "No email body received"))
+
+                    st.header("✅ Output 4: Email Automation Status")
+                    status = result.get("status", "Unknown")
+                    if status == "SENT":
+                        st.success(f"🚨 Alert Email Status: {status}")
+                    else:
+                        st.warning(f"📋 Status: {status}")
+
+                except Exception as e:
+                    st.error(f"❌ Webhook error: {e}")
